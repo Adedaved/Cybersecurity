@@ -1,6 +1,8 @@
+import asyncio
 import importlib.util
 import json
 import sqlite3
+import ssl
 import sys
 import tempfile
 import unittest
@@ -32,6 +34,47 @@ class SentinelScanTests(unittest.TestCase):
     def test_port_parser_rejects_invalid_values(self):
         with self.assertRaises(ValueError):
             sentinelscan.parse_ports("0")
+
+
+class SentinelScanNetworkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reachable_tls_failures_keep_port_open(self):
+        loop = asyncio.get_running_loop()
+        for error, expected in (
+            (ssl.SSLCertVerificationError("invalid certificate"), "certificate_error"),
+            (ssl.SSLError("handshake failed"), "handshake_error"),
+            (asyncio.TimeoutError(), "timeout"),
+        ):
+            with self.subTest(expected=expected), mock.patch.object(loop, "sock_connect", new_callable=mock.AsyncMock), mock.patch.object(asyncio, "open_connection", side_effect=error):
+                result = await sentinelscan.probe("127.0.0.1", 443, 1)
+                self.assertEqual((result.state, result.tls_state), ("open", expected))
+                self.assertIsNone(result.tls)
+
+    async def test_valid_hostname_uses_verified_tls_to_resolved_address(self):
+        loop = asyncio.get_running_loop()
+        reader = mock.Mock(read=mock.AsyncMock(return_value=b""))
+        certificate = mock.Mock()
+        certificate.cipher.return_value = ("TLS_AES_256_GCM_SHA384", "TLSv1.3", 256)
+        certificate.getpeercert.return_value = {"subject": ((("commonName", "service.example"),),)}
+        writer = mock.Mock(wait_closed=mock.AsyncMock())
+        writer.get_extra_info.return_value = certificate
+        with mock.patch.object(sentinelscan, "resolve_target", new_callable=mock.AsyncMock, return_value=["127.0.0.1"]), mock.patch.object(loop, "sock_connect", new_callable=mock.AsyncMock) as connect, mock.patch.object(asyncio, "open_connection", return_value=(reader, writer)) as stream:
+            report = await sentinelscan.scan("service.example", [443])
+        self.assertEqual(connect.await_args.args[1], ("127.0.0.1", 443))
+        options = stream.await_args.kwargs
+        self.assertEqual(options["server_hostname"], "service.example")
+        self.assertEqual(options["ssl"].verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(options["ssl"].check_hostname)
+        finding = report["findings"][0]
+        self.assertEqual((finding["state"], finding["tls_state"]), ("open", "verified"))
+        self.assertIn("subject", finding["tls"]["certificate"])
+
+    async def test_tcp_errors_skip_tls(self):
+        loop = asyncio.get_running_loop()
+        for error, expected in ((ConnectionRefusedError(), "refused"), (asyncio.TimeoutError(), "timeout")):
+            with self.subTest(expected=expected), mock.patch.object(loop, "sock_connect", side_effect=error), mock.patch.object(asyncio, "open_connection") as stream:
+                result = await sentinelscan.probe("127.0.0.1", 443, 1)
+                self.assertEqual((result.state, result.tls_state), (expected, "not_attempted"))
+                stream.assert_not_called()
 
 
 class ReconGraphTests(unittest.TestCase):

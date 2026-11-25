@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import socket
+import ipaddress
 import ssl
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ class Finding:
     banner: str | None = None
     tls: dict[str, object] | None = None
     error: str | None = None
+    tls_state: str = "not_attempted"
 
 
 def parse_ports(value: str) -> list[int]:
@@ -61,35 +63,67 @@ def _certificate_summary(cert: dict[str, object]) -> dict[str, object]:
     return {key: cert.get(key) for key in ("subject", "issuer", "notBefore", "notAfter") if cert.get(key)}
 
 
-async def probe(address: str, port: int, timeout: float) -> Finding:
-    service = COMMON_SERVICES.get(port, "unknown")
-    ssl_context = ssl.create_default_context() if port in TLS_PORTS else None
-    server_hostname = address if ssl_context else None
+async def probe(address: str, port: int, timeout: float, *, target: str | None = None) -> Finding:
+    result = Finding(address, port, "open", COMMON_SERVICES.get(port, "unknown"), "tcp-connect")
+    family = socket.AF_INET6 if ipaddress.ip_address(address).version == 6 else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setblocking(False)
+    writer = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port, ssl=ssl_context, server_hostname=server_hostname),
-            timeout,
-        )
-        tls_info = None
+        try:
+            await asyncio.wait_for(asyncio.get_running_loop().sock_connect(sock, (address, port)), timeout)
+        except (OSError, asyncio.TimeoutError) as exc:
+            result.state = "refused" if isinstance(exc, ConnectionRefusedError) else (
+                "timeout" if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else "connection_error"
+            )
+            result.evidence = "connection-failed"
+            result.error = type(exc).__name__
+            return result
+
+        context = ssl.create_default_context() if port in TLS_PORTS else None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    sock=sock, ssl=context,
+                    server_hostname=(target or address).rstrip(".") if context else None,
+                ),
+                timeout,
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            result.error = type(exc).__name__
+            if context:
+                if isinstance(exc, ssl.SSLCertVerificationError):
+                    result.tls_state = "certificate_error"
+                elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    result.tls_state = "timeout"
+                else:
+                    result.tls_state = "handshake_error"
+            return result
+
         ssl_object = writer.get_extra_info("ssl_object")
         if ssl_object:
-            tls_info = {
+            result.tls_state = "verified"
+            result.tls = {
                 "version": ssl_object.version(),
                 "cipher": ssl_object.cipher()[0] if ssl_object.cipher() else None,
                 "certificate": _certificate_summary(ssl_object.getpeercert()),
             }
-        banner = None
         try:
             data = await asyncio.wait_for(reader.read(256), min(timeout, 0.4))
             if data:
-                banner = data.decode("utf-8", errors="replace").strip()[:200]
-        except TimeoutError:
+                result.banner = data.decode("utf-8", errors="replace").strip()[:200]
+        except (OSError, asyncio.TimeoutError):
             pass
-        writer.close()
-        await writer.wait_closed()
-        return Finding(address, port, "open", service, "tcp-connect", banner, tls_info)
-    except (ConnectionRefusedError, TimeoutError, OSError, ssl.SSLError) as exc:
-        return Finding(address, port, "closed_or_filtered", service, "connection-failed", error=type(exc).__name__)
+        return result
+    finally:
+        if writer is None:
+            sock.close()
+        else:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout)
+            except (OSError, asyncio.TimeoutError):
+                writer.transport.abort()
 
 
 async def scan(target: str, ports: list[int], timeout: float = 1.0, concurrency: int = 100) -> dict[str, object]:
@@ -98,7 +132,7 @@ async def scan(target: str, ports: list[int], timeout: float = 1.0, concurrency:
 
     async def bounded(address: str, port: int) -> Finding:
         async with semaphore:
-            return await probe(address, port, timeout)
+            return await probe(address, port, timeout, target=target)
 
     findings = await asyncio.gather(*(bounded(address, port) for address in addresses for port in ports))
     return {
@@ -131,8 +165,9 @@ def main() -> int:
     else:
         print(f"SentinelScan target={result['target']} addresses={','.join(result['addresses'])}")
         open_findings = [item for item in result["findings"] if item["state"] == "open"]
-        for item in open_findings:
-            print(f"OPEN  {item['address']}:{item['port']}  service={item['service']}  evidence={item['evidence']}")
+        for item in result["findings"]:
+            error = f"  error={item['error']}" if item["error"] else ""
+            print(f"{item['state'].upper()}  {item['address']}:{item['port']}  service={item['service']}  tls={item['tls_state']}{error}")
         print(f"Summary: {len(open_findings)} open / {len(result['findings'])} tested")
     return 0
 
